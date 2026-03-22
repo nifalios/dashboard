@@ -1,42 +1,140 @@
-import yfinance as yf
-import streamlit as st
+import json
+from urllib.request import urlopen
+
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.express as px
+import streamlit as st
 
-def download_stock_data(ticker, start_date, end_date):
-    stock_data = yf.download(ticker, start=start_date, end=end_date)
-    return stock_data
+EU_COUNTRIES = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+    "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+    "SI", "ES", "SE",
+]
 
-def plot_stock_data(stock_data, ticker):
-    plt.figure(figsize=(10, 6))
-    plt.plot(stock_data['Close'], label=f'{ticker} Close Price')
-    plt.title(f'{ticker} Stock Price Over Time')
-    plt.xlabel('Date')
-    plt.ylabel('Stock Price (USD)')
-    plt.legend()
-    st.pyplot()
+EU_COUNTRY_NAMES = {
+    "AT": "Austria", "BE": "Belgium", "BG": "Bulgaria", "HR": "Croatia", "CY": "Cyprus",
+    "CZ": "Czechia", "DK": "Denmark", "EE": "Estonia", "FI": "Finland", "FR": "France",
+    "DE": "Germany", "GR": "Greece", "HU": "Hungary", "IE": "Ireland", "IT": "Italy",
+    "LV": "Latvia", "LT": "Lithuania", "LU": "Luxembourg", "MT": "Malta", "NL": "Netherlands",
+    "PL": "Poland", "PT": "Portugal", "RO": "Romania", "SK": "Slovakia", "SI": "Slovenia",
+    "ES": "Spain", "SE": "Sweden",
+}
 
-def main():
-    st.title('S&P500 Stock Price Explorer')
+EUROSTAT_URL = (
+    "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/nrg_pc_204"
+    "?freq=A&unit=KWH&currency=EUR&tax=I_TAX&consom=DC"
+)
 
-    # Sidebar for user input
-    st.sidebar.header('User Input')
 
-    # Select stock ticker
-    ticker = st.sidebar.text_input('Enter Stock Ticker (e.g., AAPL)', 'AAPL').upper()
+def _expand_jsonstat(dataset: dict) -> pd.DataFrame:
+    ids = dataset["id"]
+    sizes = dataset["size"]
+    values = dataset.get("value", {})
 
-    # Select time period
-    start_date = st.sidebar.date_input('Start Date', pd.to_datetime('2 years ago'))
-    end_date = st.sidebar.date_input('End Date', pd.to_datetime('today'))
+    dim_labels = {}
+    dim_indices = {}
+    for dim in ids:
+        category = dataset["dimension"][dim]["category"]
+        dim_labels[dim] = category.get("label", {})
+        dim_indices[dim] = category["index"]
 
-    # Download and display stock data
-    stock_data = download_stock_data(ticker, start_date, end_date)
+    time_size = sizes[-1]
+    multipliers = []
+    prod = 1
+    for size in reversed(sizes[1:]):
+        prod *= size
+        multipliers.insert(0, prod)
+    multipliers.append(1)
 
-    st.write(f"## {ticker} Stock Data from {start_date} to {end_date}")
-    st.write(stock_data.head())
+    records = []
+    for flat_idx_str, value in values.items():
+        flat_idx = int(flat_idx_str)
+        coords = []
+        remainder = flat_idx
+        for i, size in enumerate(sizes):
+            if i == len(sizes) - 1:
+                idx = remainder
+            else:
+                idx = remainder // multipliers[i]
+                remainder = remainder % multipliers[i]
+            coords.append(idx)
 
-    # Plot the selected stock data
-    plot_stock_data(stock_data, ticker)
+        row = {}
+        for dim, coord in zip(ids, coords):
+            code_for_coord = next(
+                code for code, position in dim_indices[dim].items() if position == coord
+            )
+            row[dim] = code_for_coord
+            row[f"{dim}_label"] = dim_labels[dim].get(code_for_coord, code_for_coord)
 
-if __name__ == '__main__':
+        row["price_eur_per_kwh"] = value
+        records.append(row)
+
+    return pd.DataFrame(records)
+
+
+@st.cache_data(show_spinner=False)
+def load_eu_electricity_prices() -> pd.DataFrame:
+    with urlopen(EUROSTAT_URL, timeout=30) as response:
+        dataset = json.load(response)
+
+    df = _expand_jsonstat(dataset)
+    df = df[df["geo"].isin(EU_COUNTRIES)].copy()
+    df["year"] = pd.to_numeric(df["time"], errors="coerce")
+    df = df[df["year"] >= 2010].copy()
+    df["country"] = df["geo"].map(EU_COUNTRY_NAMES).fillna(df["geo_label"])
+    df["price_eur_per_kwh"] = pd.to_numeric(df["price_eur_per_kwh"], errors="coerce")
+    df = df.sort_values(["year", "country"]).reset_index(drop=True)
+    return df[["year", "geo", "country", "price_eur_per_kwh"]]
+
+
+def main() -> None:
+    st.set_page_config(page_title="EU Electricity Prices", layout="wide")
+    st.title("EU Electricity Prices per Year (2010 onward)")
+    st.caption(
+        "Source: Eurostat dataset nrg_pc_204 (household electricity prices, EUR/kWh, taxes included)."
+    )
+
+    try:
+        prices = load_eu_electricity_prices()
+    except Exception as error:
+        st.error(
+            "Could not load data from Eurostat right now. "
+            "Please check your internet connection and try again."
+        )
+        st.exception(error)
+        return
+
+    countries = sorted(prices["country"].unique())
+    selected_countries = st.multiselect(
+        "Select countries",
+        options=countries,
+        default=["Germany", "France", "Italy", "Spain"],
+    )
+
+    filtered = prices[prices["country"].isin(selected_countries)] if selected_countries else prices
+
+    fig = px.line(
+        filtered,
+        x="year",
+        y="price_eur_per_kwh",
+        color="country",
+        markers=True,
+        labels={
+            "year": "Year",
+            "price_eur_per_kwh": "Electricity price (EUR/kWh)",
+            "country": "Country",
+        },
+    )
+    fig.update_layout(legend_title_text="Country")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Data table")
+    st.dataframe(
+        filtered.pivot(index="country", columns="year", values="price_eur_per_kwh").sort_index(),
+        use_container_width=True,
+    )
+
+
+if __name__ == "__main__":
     main()
